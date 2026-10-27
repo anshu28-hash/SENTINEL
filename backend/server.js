@@ -209,7 +209,8 @@ app.post("/api/investigations/:id/evidence", async (req, res) => {
       !description.trim() ||
       source_data === undefined ||
       source_data === null ||
-      typeof source_data !== "object"
+      typeof source_data !== "object" ||
+      Array.isArray(source_data)
     ) {
       return res.status(400).json({
         error: "evidence_type, description and source_data are required"
