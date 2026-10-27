@@ -168,6 +168,95 @@ app.patch("/api/investigations/:id", async (req, res) => {
   }
 });
 
+
+app.post("/api/investigations/:id/evidence", async (req, res) => {
+  try {
+    const { evidence_type, description, source_data } = req.body;
+    const investigationId = req.params.id;
+
+    if (
+      typeof evidence_type !== "string" ||
+      !evidence_type.trim() ||
+      typeof description !== "string" ||
+      !description.trim() ||
+      source_data === undefined ||
+      source_data === null ||
+      typeof source_data !== "object"
+    ) {
+      return res.status(400).json({
+        error: "evidence_type, description and source_data are required"
+      });
+    }
+
+    // Confirm that the investigation exists
+    const { data: investigation, error: findError } = await supabase
+      .from("investigations")
+      .select("id, alert_id")
+      .eq("id", investigationId)
+      .maybeSingle();
+
+    if (findError) {
+      console.error(findError.message);
+      return res.status(500).json({
+        error: "Could not find investigation"
+      });
+    }
+
+    if (!investigation) {
+      return res.status(404).json({
+        error: "Investigation not found"
+      });
+    }
+
+    // Save evidence
+    const { data: evidence, error } = await supabase
+      .from("evidence")
+      .insert({
+        investigation_id: investigationId,
+        evidence_type: evidence_type.trim(),
+        description: description.trim(),
+        source_data
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error("Evidence insert failed:", error.message);
+      return res.status(500).json({
+        error: "Could not save evidence"
+      });
+    }
+
+    // Record the action in the audit log
+    const { error: auditError } = await supabase
+      .from("audit_logs")
+      .insert({
+        action: "evidence_created",
+        entity_type: "evidence",
+        alert_id: investigation.alert_id,
+        investigation_id: investigationId,
+        details: {
+          evidence_id: evidence.id,
+          evidence_type: evidence.evidence_type
+        }
+      });
+
+    if (auditError) {
+      console.error("Audit log insert failed:", auditError.message);
+    }
+
+    return res.status(201).json({
+      message: "Evidence saved successfully",
+      evidence
+    });
+  } catch (err) {
+    console.error("Evidence API error:", err.message);
+    return res.status(500).json({
+      error: "Internal server error"
+    });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
