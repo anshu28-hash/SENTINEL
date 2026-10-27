@@ -1,5 +1,5 @@
 
-require("dotenv").config();
+require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 
 const express = require("express");
 const cors = require("cors");
@@ -286,6 +286,36 @@ app.post("/api/investigations/:id/evidence", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+app.get("/api/investigations/:id/evidence", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from("evidence")
+      .select("*")
+      .eq("investigation_id", id)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Evidence fetch error:", error.message);
+      return res.status(500).json({
+        error: "Failed to fetch evidence"
+      });
+    }
+
+    return res.status(200).json({
+      investigation_id: id,
+      count: data.length,
+      evidence: data
+    });
+  } catch (error) {
+    console.error("Unexpected error:", error.message);
+    return res.status(500).json({
+      error: "Internal server error"
+    });
+  }
+});
+
 
 app.listen(PORT, () => {
   console.log(`FraudLens API running on port ${PORT}`);
