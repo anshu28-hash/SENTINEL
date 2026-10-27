@@ -7,6 +7,34 @@ const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
+function requireApiToken(req, res, next) {
+  const expectedToken = process.env.API_TOKEN;
+  const authHeader = req.get("authorization");
+
+  if (!expectedToken) {
+    return res.status(500).json({
+      error: "API authentication is not configured"
+    });
+  }
+
+  if (
+    !authHeader ||
+    authHeader !== `Bearer ${expectedToken}`
+  ) {
+    return res.status(401).json({
+      error: "Unauthorized"
+    });
+  }
+
+  next();
+}
+
+// Keep health check public.
+// Protect the business API routes.
+app.use("/api/alerts", requireApiToken);
+app.use("/api/investigations", requireApiToken);
+
+
 app.use(cors());
 app.use(express.json());
 
