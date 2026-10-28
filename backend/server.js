@@ -21,6 +21,20 @@ app.use((req, res, next) => {
   next();
 });
 
+// Lazy DB initialization for Serverless / Vercel execution
+let dbInitPromise = null;
+app.use(async (req, res, next) => {
+  if (req.path.startsWith('/api')) {
+    if (!dbInitPromise) {
+      dbInitPromise = database.loadInitialData().catch(err => {
+        console.warn('DB load warning in serverless context:', err.message);
+      });
+    }
+    await dbInitPromise;
+  }
+  next();
+});
+
 // Optional Token Verification (Permissive in dev mode, strict when configured with enforce header)
 function verifyToken(req, res, next) {
   const token = process.env.API_TOKEN;
@@ -332,7 +346,7 @@ app.get('/api/stream', (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 7. FRONTEND STATIC ASSETS SERVING (Single-Port Experience)
+// 7. FRONTEND STATIC ASSETS SERVING (Local Standalone Server)
 // -------------------------------------------------------------
 const frontendDist = path.join(__dirname, '..', 'frontend', 'dist');
 if (fs.existsSync(frontendDist)) {
@@ -346,7 +360,7 @@ if (fs.existsSync(frontendDist)) {
 }
 
 // -------------------------------------------------------------
-// 8. INITIALIZE AND START SERVER
+// 8. INITIALIZE AND START STANDALONE SERVER
 // -------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 
@@ -369,12 +383,16 @@ async function bootstrap() {
     console.log(`   Simulator:      POST http://localhost:${PORT}/api/simulator/start`);
     console.log(`=======================================================`);
 
-    // Automatically start the transaction simulator!
-    // Transactions will start arriving automatically every 4 seconds!
+    // Automatically start the transaction simulator in standalone mode!
     simulator.start(4000);
   });
 }
 
-bootstrap().catch(err => {
-  console.error('Fatal initialization error:', err);
-});
+if (require.main === module) {
+  bootstrap().catch(err => {
+    console.error('Fatal initialization error:', err);
+  });
+}
+
+// Export for Vercel Serverless Functions
+module.exports = app;
