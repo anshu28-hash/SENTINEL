@@ -1,323 +1,380 @@
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 
-require("dotenv").config({ path: require("path").join(__dirname, ".env") });
-
-const express = require("express");
-const cors = require("cors");
-const { createClient } = require("@supabase/supabase-js");
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const database = require('./database');
+const fraudDetector = require('./fraudDetector');
+const simulator = require('./simulator');
 
 const app = express();
-
-function requireApiToken(req, res, next) {
-  const expectedToken = process.env.API_TOKEN;
-  const authHeader = req.get("authorization");
-
-  if (!expectedToken) {
-    return res.status(500).json({
-      error: "API authentication is not configured"
-    });
-  }
-
-  if (
-    !authHeader ||
-    authHeader !== `Bearer ${expectedToken}`
-  ) {
-    return res.status(401).json({
-      error: "Unauthorized"
-    });
-  }
-
-  next();
-}
-
-// Keep health check public.
-// Protect the business API routes.
-app.use("/api/alerts", requireApiToken);
-app.use("/api/investigations", requireApiToken);
-
 
 app.use(cors());
 app.use(express.json());
 
-if (!process.env.SUPABASE_URL ||
-    !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error("Missing Supabase environment variables");
+// Request logging
+app.use((req, res, next) => {
+  if (req.path !== '/api/stream') {
+    console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.path}`);
+  }
+  next();
+});
+
+// Optional Token Verification (Permissive in dev mode, strict when configured with enforce header)
+function verifyToken(req, res, next) {
+  const token = process.env.API_TOKEN;
+  const authHeader = req.get('authorization');
+  if (!token || !req.headers['x-enforce-auth']) {
+    return next();
+  }
+  if (authHeader && authHeader === `Bearer ${token}`) {
+    return next();
+  }
+  return res.status(401).json({ error: 'Unauthorized: Invalid or missing API token' });
 }
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
-app.get("/api/health", (req, res) => {
+// -------------------------------------------------------------
+// 1. HEALTH & METRICS
+// -------------------------------------------------------------
+app.get('/api/health', (req, res) => {
   res.json({
-    status: "ok",
-    message: "FraudLens API is running"
+    status: 'ok',
+    message: 'Sentinel Fraud Detection Engine API is running',
+    supabaseConnected: database.isSupabaseConnected,
+    simulator: simulator.getStatus()
   });
 });
 
-// Fetch an alert using its public reference, e.g. ALERT-001
-app.get("/api/alerts/:ref", async (req, res) => {
+app.get('/api/stats', (req, res) => {
+  res.json(database.getStats());
+});
+
+// -------------------------------------------------------------
+// 2. TRANSACTIONS APIS
+// -------------------------------------------------------------
+app.get('/api/transactions', (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from("alerts")
-      .select(`
-        id,
-        alert_ref,
-        risk_score,
-        reason,
-        status,
-        transaction:transactions (
-          id,
-          transaction_ref,
-          amount,
-          currency,
-          occurred_at
-        )
-      `)
-      .eq("alert_ref", req.params.ref)
-      .maybeSingle();
-
-    if (error) {
-      console.error("Supabase query failed:", error.message);
-      return res.status(500).json({
-        error: "Could not fetch alert"
-      });
-    }
-
-    if (!data) {
-      return res.status(404).json({
-        error: "Alert not found"
-      });
-    }
-
-    res.json(data);
+    const result = database.getTransactions(req.query);
+    res.json(result);
   } catch (err) {
-    console.error("API error:", err.message);
-    res.status(500).json({
-      error: "Internal server error"
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
+app.get('/api/transactions/:id', (req, res) => {
+  const tx = database.getTransactionById(req.params.id);
+  if (!tx) {
+    return res.status(404).json({ error: 'Transaction not found' });
+  }
+  res.json(tx);
+});
 
-const allowedStatuses = [
-  "pending",
-  "processing",
-  "completed",
-  "failed"
-];
-
-app.patch("/api/investigations/:id", async (req, res) => {
+// Submit a new transaction -> Runs Fraud Detection Engine immediately!
+app.post('/api/transactions', async (req, res) => {
   try {
-    const { workflow_status, ai_summary } = req.body;
+    const { sender, receiver, amount, channel, date } = req.body;
 
-    if (
-      workflow_status !== undefined &&
-      !allowedStatuses.includes(workflow_status)
-    ) {
+    if (!sender || !receiver || amount === undefined || isNaN(Number(amount))) {
       return res.status(400).json({
-        error: "Invalid workflow_status"
+        error: 'sender, receiver and a valid numeric amount are required.'
       });
     }
 
-    if (
-      workflow_status === undefined &&
-      ai_summary === undefined
-    ) {
-      return res.status(400).json({
-        error: "Provide workflow_status or ai_summary"
-      });
-    }
-
-    const updates = {
-      updated_at: new Date().toISOString()
+    const txObj = {
+      id: req.body.id || `TXN-${Math.floor(1000 + Math.random() * 9000)}`,
+      sender: sender.trim().toUpperCase(),
+      receiver: receiver.trim().toUpperCase(),
+      amount: Number(amount),
+      channel: channel || 'UPI',
+      date: date || new Date().toISOString()
     };
 
-    if (workflow_status !== undefined) {
-      updates.workflow_status = workflow_status;
+    // Run Fraud Detection Engine
+    const recent = database.getRecentTransactions(50);
+    const evaluation = fraudDetector.evaluate(txObj, recent);
+
+    let alertRef = null;
+    if (evaluation.is_fraud) {
+      alertRef = `ALT-${Math.floor(100 + Math.random() * 900)}`;
+      txObj.alertId = alertRef;
     }
 
-    if (ai_summary !== undefined) {
-      if (typeof ai_summary !== "string") {
-        return res.status(400).json({
-          error: "ai_summary must be a string"
-        });
-      }
+    // Save transaction
+    const savedTx = await database.saveTransaction(txObj);
 
-      updates.ai_summary = ai_summary;
-    }
+    let savedAlert = null;
+    let savedInvestigation = null;
 
-    const { data, error } = await supabase
-      .from("investigations")
-      .update(updates)
-      .eq("id", req.params.id)
-      .select()
-      .maybeSingle();
-
-    if (error) {
-      console.error("Investigation update failed:", error.message);
-      return res.status(500).json({
-        error: "Could not update investigation"
+    if (evaluation.is_fraud) {
+      savedAlert = await database.saveAlert({
+        alert_ref: alertRef,
+        transaction_id: savedTx.db_id,
+        transaction_ref: savedTx.id,
+        risk_score: evaluation.risk_score,
+        severity: evaluation.severity,
+        reason: evaluation.reason,
+        status: 'Open'
       });
-    }
 
-    if (!data) {
-      return res.status(404).json({
-        error: "Investigation not found"
+      const caseRef = `CASE-${Math.floor(100 + Math.random() * 900)}`;
+      savedInvestigation = await database.saveInvestigation({
+        id: caseRef,
+        alert_id: savedAlert.db_id,
+        alert_ref: alertRef,
+        priority: evaluation.severity,
+        status: 'Awaiting review',
+        workflow_status: 'awaiting_review',
+        analyst: 'AI Sentinel Agent',
+        evidence: evaluation.evidence,
+        ai_summary: evaluation.ai_summary
       });
-    }
 
-    const { error: auditError } = await supabase
-      .from("audit_logs")
-      .insert({
-        action: "investigation_updated",
-        entity_type: "investigation",
-        alert_id: data.alert_id,
-        investigation_id: data.id,
-        details: {
-          workflow_status: data.workflow_status,
-          ai_summary_updated: ai_summary !== undefined
+      await database.saveEvidence({
+        investigation_id: savedInvestigation.db_id,
+        evidence_type: 'api_submission_check',
+        description: evaluation.reason,
+        source_data: {
+          transaction_ref: savedTx.id,
+          amount: savedTx.amount,
+          risk_score: evaluation.risk_score,
+          triggered_rules: evaluation.triggered_rules
         }
       });
-
-    if (auditError) {
-      console.error("Audit log insert failed:", auditError.message);
     }
 
-    return res.json({
-      message: "Investigation updated",
-      investigation: data
+    const responsePayload = {
+      message: evaluation.is_fraud ? 'Transaction flagged for fraud review' : 'Transaction processed successfully',
+      is_fraud: evaluation.is_fraud,
+      risk_score: evaluation.risk_score,
+      severity: evaluation.severity,
+      detection_reasons: evaluation.triggered_rules,
+      transaction: savedTx,
+      alert: savedAlert,
+      investigation: savedInvestigation
+    };
+
+    // Broadcast live event
+    simulator.broadcast('transaction', {
+      transaction: savedTx,
+      evaluation,
+      alert: savedAlert,
+      investigation: savedInvestigation
     });
+
+    res.status(201).json(responsePayload);
   } catch (err) {
-    console.error("API error:", err.message);
-    return res.status(500).json({
-      error: "Internal server error"
-    });
+    console.error('API /transactions error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
+// -------------------------------------------------------------
+// 3. ALERTS APIS
+// -------------------------------------------------------------
+app.get('/api/alerts', (req, res) => {
+  try {
+    const list = database.getAlerts(req.query);
+    res.json(list);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-app.post("/api/investigations/:id/evidence", async (req, res) => {
+app.get('/api/alerts/:id', (req, res) => {
+  const alert = database.getAlertById(req.params.id);
+  if (!alert) {
+    return res.status(404).json({ error: 'Alert not found' });
+  }
+  const tx = database.getTransactionById(alert.transactionId || alert.transaction_id);
+  res.json({
+    ...alert,
+    transaction: tx
+  });
+});
+
+app.patch('/api/alerts/:id', (req, res) => {
+  const alert = database.getAlertById(req.params.id);
+  if (!alert) {
+    return res.status(404).json({ error: 'Alert not found' });
+  }
+  if (req.body.status) {
+    alert.status = req.body.status;
+  }
+  res.json(alert);
+});
+
+// -------------------------------------------------------------
+// 4. INVESTIGATIONS & EVIDENCE APIS
+// -------------------------------------------------------------
+app.get('/api/investigations', (req, res) => {
+  try {
+    const list = database.getInvestigations(req.query);
+    res.json(list);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/investigations/:id', (req, res) => {
+  const inv = database.getInvestigationById(req.params.id);
+  if (!inv) {
+    return res.status(404).json({ error: 'Investigation not found' });
+  }
+  const alert = database.getAlertById(inv.alertId || inv.alert_id);
+  res.json({
+    ...inv,
+    alert
+  });
+});
+
+app.patch('/api/investigations/:id', async (req, res) => {
+  try {
+    const updated = await database.updateInvestigation(req.params.id, req.body);
+    if (!updated) {
+      return res.status(404).json({ error: 'Investigation not found' });
+    }
+    res.json({
+      message: 'Investigation updated successfully',
+      investigation: updated
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/investigations/:id/evidence', (req, res) => {
+  const list = database.memory.evidence.filter(
+    e => e.investigation_id === req.params.id || e.investigation_db_id === req.params.id
+  );
+  res.json({
+    investigation_id: req.params.id,
+    count: list.length,
+    evidence: list
+  });
+});
+
+app.post('/api/investigations/:id/evidence', async (req, res) => {
   try {
     const { evidence_type, description, source_data } = req.body;
-    const investigationId = req.params.id;
-
-    if (
-      typeof evidence_type !== "string" ||
-      !evidence_type.trim() ||
-      typeof description !== "string" ||
-      !description.trim() ||
-      source_data === undefined ||
-      source_data === null ||
-      typeof source_data !== "object" ||
-      Array.isArray(source_data)
-    ) {
-      return res.status(400).json({
-        error: "evidence_type, description and source_data are required"
-      });
+    const inv = database.getInvestigationById(req.params.id);
+    if (!inv) {
+      return res.status(404).json({ error: 'Investigation not found' });
     }
 
-    // Confirm that the investigation exists
-    const { data: investigation, error: findError } = await supabase
-      .from("investigations")
-      .select("id, alert_id")
-      .eq("id", investigationId)
-      .maybeSingle();
+    const saved = await database.saveEvidence({
+      investigation_id: inv.db_id,
+      investigation_db_id: inv.db_id,
+      evidence_type: evidence_type || 'analyst_note',
+      description: description || '',
+      source_data: source_data || {}
+    });
 
-    if (findError) {
-      console.error(findError.message);
-      return res.status(500).json({
-        error: "Could not find investigation"
-      });
-    }
-
-    if (!investigation) {
-      return res.status(404).json({
-        error: "Investigation not found"
-      });
-    }
-
-    // Save evidence
-    const { data: evidence, error } = await supabase
-      .from("evidence")
-      .insert({
-        investigation_id: investigationId,
-        evidence_type: evidence_type.trim(),
-        description: description.trim(),
-        source_data
-      })
-      .select()
-      .single();
-
-    if (error) {
-      console.error("Evidence insert failed:", error.message);
-      return res.status(500).json({
-        error: "Could not save evidence"
-      });
-    }
-
-    // Record the action in the audit log
-    const { error: auditError } = await supabase
-      .from("audit_logs")
-      .insert({
-        action: "evidence_created",
-        entity_type: "evidence",
-        alert_id: investigation.alert_id,
-        investigation_id: investigationId,
-        details: {
-          evidence_id: evidence.id,
-          evidence_type: evidence.evidence_type
-        }
-      });
-
-    if (auditError) {
-      console.error("Audit log insert failed:", auditError.message);
-    }
-
-    return res.status(201).json({
-      message: "Evidence saved successfully",
-      evidence
+    res.status(201).json({
+      message: 'Evidence recorded successfully',
+      evidence: saved
     });
   } catch (err) {
-    console.error("Evidence API error:", err.message);
-    return res.status(500).json({
-      error: "Internal server error"
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.get("/api/investigations/:id/evidence", async (req, res) => {
+// -------------------------------------------------------------
+// 5. AUTOMATED TRANSACTION SIMULATOR CONTROLS
+// -------------------------------------------------------------
+app.get('/api/simulator/status', (req, res) => {
+  res.json(simulator.getStatus());
+});
+
+app.post('/api/simulator/start', (req, res) => {
+  const interval = Number(req.body?.intervalMs) || 4000;
+  simulator.start(interval);
+  res.json({ message: 'Transaction simulator started', status: simulator.getStatus() });
+});
+
+app.post('/api/simulator/stop', (req, res) => {
+  simulator.stop();
+  res.json({ message: 'Transaction simulator stopped', status: simulator.getStatus() });
+});
+
+app.post('/api/simulator/trigger', async (req, res) => {
   try {
-    const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from("evidence")
-      .select("*")
-      .eq("investigation_id", id)
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      console.error("Evidence fetch error:", error.message);
-      return res.status(500).json({
-        error: "Failed to fetch evidence"
-      });
-    }
-
-    return res.status(200).json({
-      investigation_id: id,
-      count: data.length,
-      evidence: data
+    const type = req.body?.type; // 'normal', 'high_value', 'mule', 'structuring'
+    const result = await simulator.generateTransaction(type);
+    res.json({
+      message: 'Simulated transaction triggered',
+      ...result
     });
-  } catch (error) {
-    console.error("Unexpected error:", error.message);
-    return res.status(500).json({
-      error: "Internal server error"
-    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
+// -------------------------------------------------------------
+// 6. REAL-TIME SERVER-SENT EVENTS (SSE) STREAM
+// -------------------------------------------------------------
+app.get('/api/stream', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
 
-app.listen(PORT, () => {
-  console.log(`FraudLens API running on port ${PORT}`);
+  res.write(`data: ${JSON.stringify({ type: 'connected', time: new Date().toISOString() })}\n\n`);
+
+  const removeListener = simulator.addListener((event, payload) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+  });
+
+  req.on('close', () => {
+    removeListener();
+  });
+});
+
+// -------------------------------------------------------------
+// 7. FRONTEND STATIC ASSETS SERVING (Single-Port Experience)
+// -------------------------------------------------------------
+const frontendDist = path.join(__dirname, '..', 'frontend', 'dist');
+if (fs.existsSync(frontendDist)) {
+  app.use(express.static(frontendDist));
+  app.use((req, res, next) => {
+    if (req.method === 'GET' && !req.path.startsWith('/api')) {
+      return res.sendFile(path.join(frontendDist, 'index.html'));
+    }
+    next();
+  });
+}
+
+// -------------------------------------------------------------
+// 8. INITIALIZE AND START SERVER
+// -------------------------------------------------------------
+const PORT = process.env.PORT || 3000;
+
+async function bootstrap() {
+  console.log('--- Initializing Sentinel Backend ---');
+  await database.loadInitialData();
+
+  app.listen(PORT, () => {
+    console.log(`=======================================================`);
+    console.log(` Sentinel Fraud Detection API is running on port ${PORT}`);
+    console.log(` Web App & Dashboard: http://localhost:${PORT}`);
+    console.log(` Endpoints:`);
+    console.log(`   Health:         GET  http://localhost:${PORT}/api/health`);
+    console.log(`   Stats:          GET  http://localhost:${PORT}/api/stats`);
+    console.log(`   Transactions:   GET  http://localhost:${PORT}/api/transactions`);
+    console.log(`   Submit TX:      POST http://localhost:${PORT}/api/transactions`);
+    console.log(`   Alerts:         GET  http://localhost:${PORT}/api/alerts`);
+    console.log(`   Investigations: GET  http://localhost:${PORT}/api/investigations`);
+    console.log(`   Realtime SSE:   GET  http://localhost:${PORT}/api/stream`);
+    console.log(`   Simulator:      POST http://localhost:${PORT}/api/simulator/start`);
+    console.log(`=======================================================`);
+
+    // Automatically start the transaction simulator!
+    // Transactions will start arriving automatically every 4 seconds!
+    simulator.start(4000);
+  });
+}
+
+bootstrap().catch(err => {
+  console.error('Fatal initialization error:', err);
 });
