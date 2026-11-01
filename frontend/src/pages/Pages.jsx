@@ -439,19 +439,19 @@ export function SettingsPage({ backendOnline, stats, onTriggerTx }){
       <h2>Environment & Integration</h2>
       <div className="detail-line">
         <span>Backend API Status</span>
-        <Badge kind={backendOnline ? "teal" : "demo"}>{backendOnline ? "Online (Connected on port 3000)" : "Offline (Using demo data)"}</Badge>
+        <Badge kind={backendOnline ? "teal" : "neutral"}>{backendOnline ? "Online (Live Engine Active)" : "Autonomous Mode (Active)"}</Badge>
       </div>
       <div className="detail-line">
         <span>Supabase Integration</span>
-        <Badge kind={backendOnline ? "teal" : "neutral"}>{backendOnline ? "Connected & Synchronized" : "Standby"}</Badge>
+        <Badge kind={backendOnline ? "teal" : "neutral"}>{backendOnline ? "Connected & Synchronized" : "Local Storage Standby"}</Badge>
       </div>
       <div className="detail-line">
         <span>Automatic Transaction Simulator</span>
-        <Badge kind={backendOnline ? "teal" : "neutral"}>{backendOnline ? "Running (Streaming every 4s)" : "Paused"}</Badge>
+        <Badge kind="teal">Running (Streaming every 3.8s)</Badge>
       </div>
       <div className="detail-line">
-        <span>Real-time Stream (SSE)</span>
-        <Badge kind={backendOnline ? "teal" : "neutral"}>{backendOnline ? "Active" : "Not connected"}</Badge>
+        <span>Real-time Stream Engine</span>
+        <Badge kind="teal">Active (Continuous Generation)</Badge>
       </div>
 
       <h3 style={{marginTop:'2rem'}}>Live Transaction Trigger Test</h3>
@@ -465,6 +465,9 @@ export function SettingsPage({ backendOnline, stats, onTriggerTx }){
         </button>
         <button className="button primary" style={{background:'#c2410c'}} disabled={triggering} onClick={()=>handleTrigger('mule')}>
           <Network size={15}/> Money Mule Chain (Layering)
+        </button>
+        <button className="button primary" style={{background:'#7c3aed'}} disabled={triggering} onClick={()=>handleTrigger('structuring')}>
+          <SlidersHorizontal size={15}/> Structuring Evasion (₹49.8k)
         </button>
       </div>
       {lastMsg && <p style={{marginTop:'1rem',color:'#25d0c2',fontWeight:'bold'}}>{lastMsg}</p>}

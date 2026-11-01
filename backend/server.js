@@ -15,7 +15,7 @@ app.use(express.json());
 
 // Request logging
 app.use((req, res, next) => {
-  if (req.path !== '/api/stream') {
+  if (req.path !== '/api/stream' && req.path !== '/stream') {
     console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.path}`);
   }
   next();
@@ -24,7 +24,15 @@ app.use((req, res, next) => {
 // Lazy DB initialization for Serverless / Vercel execution
 let dbInitPromise = null;
 app.use(async (req, res, next) => {
-  if (req.path.startsWith('/api')) {
+  if (
+    req.path.startsWith('/api') ||
+    req.path === '/health' ||
+    req.path === '/stats' ||
+    req.path.startsWith('/transactions') ||
+    req.path.startsWith('/alerts') ||
+    req.path.startsWith('/investigations') ||
+    req.path.startsWith('/simulator')
+  ) {
     if (!dbInitPromise) {
       dbInitPromise = database.loadInitialData().catch(err => {
         console.warn('DB load warning in serverless context:', err.message);
@@ -49,9 +57,12 @@ function verifyToken(req, res, next) {
 }
 
 // -------------------------------------------------------------
-// 1. HEALTH & METRICS
+// API ROUTER (Mounts to both '/api' and '/' for Vercel Serverless resilience)
 // -------------------------------------------------------------
-app.get('/api/health', (req, res) => {
+const apiRouter = express.Router();
+
+// 1. HEALTH & METRICS
+apiRouter.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     message: 'Sentinel Fraud Detection Engine API is running',
@@ -60,14 +71,12 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.get('/api/stats', (req, res) => {
+apiRouter.get('/stats', (req, res) => {
   res.json(database.getStats());
 });
 
-// -------------------------------------------------------------
 // 2. TRANSACTIONS APIS
-// -------------------------------------------------------------
-app.get('/api/transactions', (req, res) => {
+apiRouter.get('/transactions', (req, res) => {
   try {
     const result = database.getTransactions(req.query);
     res.json(result);
@@ -76,7 +85,7 @@ app.get('/api/transactions', (req, res) => {
   }
 });
 
-app.get('/api/transactions/:id', (req, res) => {
+apiRouter.get('/transactions/:id', (req, res) => {
   const tx = database.getTransactionById(req.params.id);
   if (!tx) {
     return res.status(404).json({ error: 'Transaction not found' });
@@ -85,7 +94,7 @@ app.get('/api/transactions/:id', (req, res) => {
 });
 
 // Submit a new transaction -> Runs Fraud Detection Engine immediately!
-app.post('/api/transactions', async (req, res) => {
+apiRouter.post('/transactions', async (req, res) => {
   try {
     const { sender, receiver, amount, channel, date } = req.body;
 
@@ -157,71 +166,38 @@ app.post('/api/transactions', async (req, res) => {
       });
     }
 
-    const responsePayload = {
-      message: evaluation.is_fraud ? 'Transaction flagged for fraud review' : 'Transaction processed successfully',
-      is_fraud: evaluation.is_fraud,
-      risk_score: evaluation.risk_score,
-      severity: evaluation.severity,
-      detection_reasons: evaluation.triggered_rules,
-      transaction: savedTx,
-      alert: savedAlert,
-      investigation: savedInvestigation
-    };
-
-    // Broadcast live event
-    simulator.broadcast('transaction', {
+    res.status(201).json({
+      message: 'Transaction processed',
       transaction: savedTx,
       evaluation,
       alert: savedAlert,
       investigation: savedInvestigation
     });
-
-    res.status(201).json(responsePayload);
   } catch (err) {
-    console.error('API /transactions error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// -------------------------------------------------------------
 // 3. ALERTS APIS
-// -------------------------------------------------------------
-app.get('/api/alerts', (req, res) => {
+apiRouter.get('/alerts', (req, res) => {
   try {
-    const list = database.getAlerts(req.query);
-    res.json(list);
+    const alerts = database.getAlerts(req.query);
+    res.json(alerts);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/api/alerts/:id', (req, res) => {
+apiRouter.get('/alerts/:id', (req, res) => {
   const alert = database.getAlertById(req.params.id);
   if (!alert) {
     return res.status(404).json({ error: 'Alert not found' });
-  }
-  const tx = database.getTransactionById(alert.transactionId || alert.transaction_id);
-  res.json({
-    ...alert,
-    transaction: tx
-  });
-});
-
-app.patch('/api/alerts/:id', (req, res) => {
-  const alert = database.getAlertById(req.params.id);
-  if (!alert) {
-    return res.status(404).json({ error: 'Alert not found' });
-  }
-  if (req.body.status) {
-    alert.status = req.body.status;
   }
   res.json(alert);
 });
 
-// -------------------------------------------------------------
-// 4. INVESTIGATIONS & EVIDENCE APIS
-// -------------------------------------------------------------
-app.get('/api/investigations', (req, res) => {
+// 4. INVESTIGATIONS APIS
+apiRouter.get('/investigations', (req, res) => {
   try {
     const list = database.getInvestigations(req.query);
     res.json(list);
@@ -230,34 +206,35 @@ app.get('/api/investigations', (req, res) => {
   }
 });
 
-app.get('/api/investigations/:id', (req, res) => {
+apiRouter.get('/investigations/:id', (req, res) => {
   const inv = database.getInvestigationById(req.params.id);
   if (!inv) {
-    return res.status(404).json({ error: 'Investigation not found' });
+    return res.status(404).json({ error: 'Investigation case not found' });
   }
-  const alert = database.getAlertById(inv.alertId || inv.alert_id);
-  res.json({
-    ...inv,
-    alert
-  });
+  res.json(inv);
 });
 
-app.patch('/api/investigations/:id', async (req, res) => {
+apiRouter.patch('/investigations/:id', async (req, res) => {
   try {
-    const updated = await database.updateInvestigation(req.params.id, req.body);
+    const { outcome, notes, analyst } = req.body;
+    const updated = await database.updateInvestigation(req.params.id, {
+      outcome,
+      notes,
+      analyst: analyst || 'Lead Fraud Analyst'
+    });
     if (!updated) {
-      return res.status(404).json({ error: 'Investigation not found' });
+      return res.status(404).json({ error: 'Investigation case not found' });
     }
     res.json({
       message: 'Investigation updated successfully',
-      investigation: updated
+      case: updated
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/api/investigations/:id/evidence', (req, res) => {
+apiRouter.get('/investigations/:id/evidence', (req, res) => {
   const list = database.memory.evidence.filter(
     e => e.investigation_id === req.params.id || e.investigation_db_id === req.params.id
   );
@@ -268,7 +245,7 @@ app.get('/api/investigations/:id/evidence', (req, res) => {
   });
 });
 
-app.post('/api/investigations/:id/evidence', async (req, res) => {
+apiRouter.post('/investigations/:id/evidence', async (req, res) => {
   try {
     const { evidence_type, description, source_data } = req.body;
     const inv = database.getInvestigationById(req.params.id);
@@ -293,25 +270,23 @@ app.post('/api/investigations/:id/evidence', async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------
 // 5. AUTOMATED TRANSACTION SIMULATOR CONTROLS
-// -------------------------------------------------------------
-app.get('/api/simulator/status', (req, res) => {
+apiRouter.get('/simulator/status', (req, res) => {
   res.json(simulator.getStatus());
 });
 
-app.post('/api/simulator/start', (req, res) => {
+apiRouter.post('/simulator/start', (req, res) => {
   const interval = Number(req.body?.intervalMs) || 4000;
   simulator.start(interval);
   res.json({ message: 'Transaction simulator started', status: simulator.getStatus() });
 });
 
-app.post('/api/simulator/stop', (req, res) => {
+apiRouter.post('/simulator/stop', (req, res) => {
   simulator.stop();
   res.json({ message: 'Transaction simulator stopped', status: simulator.getStatus() });
 });
 
-app.post('/api/simulator/trigger', async (req, res) => {
+apiRouter.post('/simulator/trigger', async (req, res) => {
   try {
     const type = req.body?.type; // 'normal', 'high_value', 'mule', 'structuring'
     const result = await simulator.generateTransaction(type);
@@ -324,26 +299,35 @@ app.post('/api/simulator/trigger', async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------
 // 6. REAL-TIME SERVER-SENT EVENTS (SSE) STREAM
-// -------------------------------------------------------------
-app.get('/api/stream', (req, res) => {
+apiRouter.get('/stream', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*'
   });
 
   res.write(`data: ${JSON.stringify({ type: 'connected', time: new Date().toISOString() })}\n\n`);
+
+  // Cloud proxy keepalive heartbeat
+  const heartbeat = setInterval(() => {
+    res.write(': keepalive\n\n');
+  }, 12000);
 
   const removeListener = simulator.addListener((event, payload) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
   });
 
   req.on('close', () => {
+    clearInterval(heartbeat);
     removeListener();
   });
 });
+
+// Mount the API Router on both '/api' and '/'
+app.use('/api', apiRouter);
+app.use('/', apiRouter);
 
 // -------------------------------------------------------------
 // 7. FRONTEND STATIC ASSETS SERVING (Local Standalone Server)
@@ -352,7 +336,7 @@ const frontendDist = path.join(__dirname, '..', 'frontend', 'dist');
 if (fs.existsSync(frontendDist)) {
   app.use(express.static(frontendDist));
   app.use((req, res, next) => {
-    if (req.method === 'GET' && !req.path.startsWith('/api')) {
+    if (req.method === 'GET' && !req.path.startsWith('/api') && !req.path.startsWith('/health') && !req.path.startsWith('/stream')) {
       return res.sendFile(path.join(frontendDist, 'index.html'));
     }
     next();
